@@ -100,6 +100,10 @@ static void *mpfVtpMonitorMain(void *args)
         pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
     }
 
+    close(mon_fd);
+    mon->mon_fd = 0;
+    close(evt_fd);
+    mon->evt_fd = 0;
     return NULL;
 }
 
@@ -112,7 +116,6 @@ static fpga_result mpfVtpMonitorInit(
     _mpf_handle_p _mpf_handle
 )
 {
-    fpga_result r;
     mpf_vtp_monitor* mon;
 
     if (_mpf_handle->dbg_mode)
@@ -137,6 +140,11 @@ static fpga_result mpfVtpMonitorInit(
 
     if ((-1 == fd) || (mon_version < 2))
     {
+        if (-1 != fd)
+        {
+            close(fd);
+        }
+
         // Ignore the error?
         if (getenv("MPF_NO_MMU_MONITOR_WARNING"))
         {
@@ -195,14 +203,14 @@ static fpga_result mpfVtpMonitorInit(
             MPF_FPGA_MSG("  %s", strerror(errno));
         }
 
-        r = FPGA_EXCEPTION;
-        goto fail;
+        close(evt_fd);
+        mon->evt_fd = 0;
+        close(fd);
+        mon->mon_fd = 0;
+        return FPGA_EXCEPTION;
     }
 
     return FPGA_OK;
-
-  fail:
-    return r;
 }
 
 
@@ -269,6 +277,17 @@ fpga_result mpfVtpMonitorTerm(
         pthread_cancel(monitor->mon_tid);
         pthread_join(monitor->mon_tid, NULL);
         monitor->mon_tid = 0;
+    }
+
+    if (monitor->mon_fd > 0)
+    {
+        close(monitor->mon_fd);
+        monitor->mon_fd = 0;
+    }
+    if (monitor->evt_fd > 0)
+    {
+        close(monitor->evt_fd);
+        monitor->evt_fd = 0;
     }
 
     // Release the top-level monitor descriptor

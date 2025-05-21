@@ -42,6 +42,7 @@
 #include <uuid/uuid.h>
 #include <time.h>
 #include <immintrin.h>
+#include <cpuid.h>
 
 #include <opae/fpga.h>
 #include <opae/mpf/mpf.h>
@@ -61,6 +62,7 @@
 #define KB(x) ((x) * 1024)
 #endif
 
+static const size_t default_bufsize = MB(4);
 
 // Engine's address mode
 typedef enum
@@ -93,6 +95,7 @@ typedef struct
 
     uint32_t max_burst_size;
     uint32_t group;
+    uint32_t eng_type;
     t_fpga_addr_mode addr_mode;
     bool natural_bursts;
     bool ordered_read_responses;
@@ -109,6 +112,7 @@ static char *engine_type[] =
 {
     "CCI-P",
     "Avalon",
+    "AXI-MM",
     NULL
 };
 
@@ -134,6 +138,26 @@ flushRange(void* start, size_t len)
 {
     uint8_t* cl = start;
     uint8_t* end = start + len;
+
+    // Does the CPU support clflushopt?
+    static bool checked_clflushopt;
+    static bool supports_clflushopt;
+
+    if (! checked_clflushopt)
+    {
+        checked_clflushopt = true;
+        supports_clflushopt = false;
+
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_max(0, 0) >= 7)
+        {
+            __cpuid_count(7, 0, eax, ebx, ecx, edx);
+            // bit_CLFLUSHOPT is (1 << 23)
+            supports_clflushopt = (((1 << 23) & ebx) != 0);
+            printf("#  Processor supports clflushopt: %d\n", supports_clflushopt);
+        }
+    }
+    if (! supports_clflushopt) return;
 
     while (cl < end)
     {
@@ -192,13 +216,14 @@ initEngine(
     s_eng_bufs[e].ordered_read_responses = (r >> 39) & 1;
     s_eng_bufs[e].addr_mode = (r >> 40) & 3;
     s_eng_bufs[e].group = (r >> 47) & 7;
+    s_eng_bufs[e].eng_type = (r >> 35) & 7;
     uint32_t eng_num = (r >> 42) & 31;
-    printf("  Engine %d type: %s\n", e, engine_type[(r >> 35) & 1]);
-    printf("  Engine %d max burst size: %d\n", e, s_eng_bufs[e].max_burst_size);
-    printf("  Engine %d natural bursts: %d\n", e, s_eng_bufs[e].natural_bursts);
-    printf("  Engine %d ordered read responses: %d\n", e, s_eng_bufs[e].ordered_read_responses);
-    printf("  Engine %d addressing mode: %s\n", e, addr_mode_str[s_eng_bufs[e].addr_mode]);
-    printf("  Engine %d group: %d\n", e, s_eng_bufs[e].group);
+    printf("#  Engine %d type: %s\n", e, engine_type[s_eng_bufs[e].eng_type]);
+    printf("#  Engine %d max burst size: %d\n", e, s_eng_bufs[e].max_burst_size);
+    printf("#  Engine %d natural bursts: %d\n", e, s_eng_bufs[e].natural_bursts);
+    printf("#  Engine %d ordered read responses: %d\n", e, s_eng_bufs[e].ordered_read_responses);
+    printf("#  Engine %d addressing mode: %s\n", e, addr_mode_str[s_eng_bufs[e].addr_mode]);
+    printf("#  Engine %d group: %d\n", e, s_eng_bufs[e].group);
 
     if (eng_num != e)
     {
@@ -207,20 +232,20 @@ initEngine(
     }
 
     // Separate read and write buffers.
-    s_eng_bufs[e].rd_buf = allocSharedBuffer(mpf_handle, MB(2));
+    s_eng_bufs[e].rd_buf = allocSharedBuffer(mpf_handle, default_bufsize);
     assert(NULL != s_eng_bufs[e].rd_buf);
-    s_eng_bufs[e].rd_buf_size = MB(2);
+    s_eng_bufs[e].rd_buf_size = default_bufsize;
     initReadBuf(s_eng_bufs[e].rd_buf, s_eng_bufs[e].rd_buf_size);
-    flushRange((void*)s_eng_bufs[e].rd_buf, MB(2));
+    flushRange((void*)s_eng_bufs[e].rd_buf, default_bufsize);
 
-    s_eng_bufs[e].wr_buf = allocSharedBuffer(mpf_handle, MB(2));
+    s_eng_bufs[e].wr_buf = allocSharedBuffer(mpf_handle, default_bufsize);
     assert(NULL != s_eng_bufs[e].wr_buf);
-    s_eng_bufs[e].wr_buf_size = MB(2);
+    s_eng_bufs[e].wr_buf_size = default_bufsize;
 
-    // Set the buffer size mask. The buffer is 2MB but the mask covers
-    // only 1MB. This allows bursts to flow a bit beyond the mask
-    // without concern for overflow.
-    csrEngWrite(csr_handle, e, 4, (MB(1) / CL(1)) - 1);
+    // Set the buffer size mask. Only half the buffer is used so
+    // bursts can flow a bit beyond the mask without concern for
+    // overflow.
+    csrEngWrite(csr_handle, e, 4, (default_bufsize / 2) / CL(1) - 1);
 }
 
 
@@ -370,8 +395,7 @@ testVtpFailurePath(
             csrEnableEngines(s_csr_handle, emask);
 
             struct timespec wait_time;
-            // Poll less often in simulation
-            wait_time.tv_sec = (s_is_ase ? 1 : 0);
+            wait_time.tv_sec = 0;
             wait_time.tv_nsec = 1000000;
 
             // Loop until the test starts
@@ -505,7 +529,7 @@ testSmallRegions(
                         // Clear the write buffer
                         memset((void*)s_eng_bufs[e].wr_buf, 0,
                                s_eng_bufs[e].wr_buf_size);
-                        flushRange((void*)s_eng_bufs[e].wr_buf, MB(2));
+                        flushRange((void*)s_eng_bufs[e].wr_buf, default_bufsize);
 
                         // Configure engine burst details
                         csrEngWrite(s_csr_handle, e, 2,
@@ -534,8 +558,7 @@ testSmallRegions(
                 // and the engine active flag going high. Execution is done when
                 // the engine is enabled and the active flag goes low.
                 struct timespec wait_time;
-                // Poll less often in simulation
-                wait_time.tv_sec = (s_is_ase ? 1 : 0);
+                wait_time.tv_sec = 0;
                 wait_time.tv_nsec = 1000000;
                 while ((csrGetEnginesEnabled(s_csr_handle) == 0) ||
                        csrGetEnginesActive(s_csr_handle))
@@ -580,7 +603,7 @@ testSmallRegions(
                         uint32_t write_error_line;
                         if (mode & 2)
                         {
-                            flushRange((void*)s_eng_bufs[e].wr_buf, MB(2));
+                            flushRange((void*)s_eng_bufs[e].wr_buf, default_bufsize);
 
                             writes_ok = testExpectedWrites(
                                 (uint64_t*)s_eng_bufs[e].wr_buf,
@@ -695,7 +718,7 @@ runBandwidth(
 
     // Wait for them to start
     struct timespec wait_time;
-    wait_time.tv_sec = (s_is_ase ? 1 : 0);
+    wait_time.tv_sec = 0;
     wait_time.tv_nsec = 1000000;
     while (csrGetEnginesEnabled(s_csr_handle) == 0)
     {
@@ -703,7 +726,7 @@ runBandwidth(
     }
 
     // Let them run for a while
-    sleep(s_is_ase ? 10 : 1);
+    usleep(s_is_ase ? 10000000 : 100000);
     
     csrDisableEngines(s_csr_handle, emask);
 
@@ -742,15 +765,15 @@ runBandwidth(
 
     if (! write_lines)
     {
-        printf("  Read GB/s:  %f\n", read_bw);
+        printf("  Read GiB/s:  %f\n", read_bw);
     }
     else if (! read_lines)
     {
-        printf("  Write GB/s: %f\n", write_bw);
+        printf("  Write GiB/s: %f\n", write_bw);
     }
     else
     {
-        printf("  R+W GB/s:   %f (read %f, write %f)\n",
+        printf("  R+W GiB/s:   %f (read %f, write %f)\n",
                read_bw + write_bw, read_bw, write_bw);
     }
 
@@ -805,7 +828,7 @@ testHostChanVtp(
     s_csr_handle = csr_handle;
     s_is_ase = is_ase;
 
-    printf("Test ID: %016" PRIx64 " %016" PRIx64 "\n",
+    printf("# Test ID: %016" PRIx64 " %016" PRIx64 "\n",
            csrEngGlobRead(csr_handle, 1),
            csrEngGlobRead(csr_handle, 0));
 
@@ -814,7 +837,7 @@ testHostChanVtp(
     uint32_t engine_groups = csrEngGlobRead(csr_handle, 2);
     num_grp_engines[0] = (uint8_t)engine_groups;
     num_grp_engines[1] = (uint8_t)(engine_groups >> 8);
-    printf("Engines: %d (g0 %d, g1 %d)\n", num_engines,
+    printf("# Engines: %d (g0 %d, g1 %d)\n", num_engines,
            num_grp_engines[0], num_grp_engines[1]);
     assert(0 != num_grp_engines[0]);
 
@@ -843,6 +866,9 @@ testHostChanVtp(
             assert(FPGA_OK == r);
         }
     }
+
+    // Force smaller page mapping to trigger more MPF activity
+    mpfVtpSetMaxPhysPageSize(mpf_handle[0], MPF_VTP_PAGE_4KB);
 
     // Allocate memory buffers for each engine
     s_eng_bufs = malloc(num_engines * sizeof(t_engine_buf));

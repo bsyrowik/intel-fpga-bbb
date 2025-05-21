@@ -21,6 +21,7 @@
  */
 
 #include <linux/version.h>
+#include <linux/dma-mapping.h>
 #include <linux/eventfd.h>
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
@@ -44,25 +45,12 @@ static struct miscdevice near_mem_map_miscdev = {
 	.mode = 0644
 };
 
-// Address of PCIe MMCFG area
-unsigned long physaddr_param = 0;
-MODULE_PARM_DESC(physaddr_param, "MMCFG physical address to map");
-module_param(physaddr_param, ulong, 0440);
-
 // Ideally we would look up the NUMA mask given a memory controller.
 // For now, it's just a parameter that can be set when the driver
 // is loaded.
 unsigned long numa_mask_param = 0;
 MODULE_PARM_DESC(numa_mask_param, "MMCFG associated NUMA memory domains mask");
 module_param(numa_mask_param, ulong, 0440);
-
-unsigned long csr_num_param = 0x43;
-MODULE_PARM_DESC(csr_num_param, "MMCFG 32-bit CSR index to read");
-module_param(csr_num_param, ulong, 0440);
-
-// Mapped page at physaddr_param
-static void __iomem *ha_mem_ctrl_p;
-static u64 ctrl_base_phys;
 
 static int fpga_near_mem_map_open(struct inode *inode, struct file *file)
 {
@@ -168,19 +156,27 @@ static long get_vaddr_page_vma_info(struct mm_struct *mm, u64 vaddr,
 	struct vm_area_struct *vma;
 	struct page *page;
 
-	*base_phys = ctrl_base_phys;
+	*base_phys = 0;
 	*page_shift = 0;
 	*page_phys = 0;
 	*page_nid = 0;
 	*vm_flags = 0;
 
 	/* Lock the mm */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+	mmap_read_lock(mm);
+#else
 	down_read(&mm->mmap_sem);
+#endif
 
 	/* Is there a mapping at vaddr? */
 	vma = find_vma(mm, vaddr);
 	if (!vma || (vaddr < vma->vm_start)) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+		mmap_read_unlock(mm);
+#else
 		up_read(&mm->mmap_sem);
+#endif
 		return -ENOMEM; /* no mapping */
 	}
 
@@ -207,7 +203,11 @@ static long get_vaddr_page_vma_info(struct mm_struct *mm, u64 vaddr,
 		*page_nid = page_to_nid(page);
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+	mmap_read_unlock(mm);
+#else
 	up_read(&mm->mmap_sem);
+#endif
 	return 0;
 }
 
@@ -263,7 +263,7 @@ static long fpga_near_mem_map_ioctl_base_phys_addr(void *arg)
 		return -EINVAL;
 
 	req.flags = 0;
-	req.base_phys = ctrl_base_phys;
+	req.base_phys = 0;
 	req.numa_mask = numa_mask_param;
 
 	dev_dbg(dev, "%s: pid %d, base_phys 0x%llx, numa_mask 0x%llx\n", __func__,
@@ -312,36 +312,6 @@ static const struct file_operations ops = {
 
 static int __init fpga_near_mem_map_init(void)
 {
-	ctrl_base_phys = 0;
-	if (physaddr_param) {
-		/* perform sanity checking and fixups */
-		if (physaddr_param % PAGE_SIZE) {
-			dprintf(0, "address not aligned (page size 0x%lx), bombing out\n",
-				PAGE_SIZE);
-			return -1;
-		}
-
-		if ((4 * (csr_num_param + 1)) >= PAGE_SIZE) {
-			dprintf(0, "csr number (0x%lx) exceeds page size, bombing out\n",
-				csr_num_param);
-			return -1;
-		}
-
-		/* create the memory mapping */
-		ha_mem_ctrl_p = ioremap(physaddr_param, PAGE_SIZE);
-		if (NULL == ha_mem_ctrl_p) {
-			dprintf(0, "ioremap failed\n");
-			return -1;
-		}
-
-
-		if (physaddr_param) {
-			u32 *csraddress;
-			csraddress = (u32 *)ha_mem_ctrl_p + csr_num_param;
-			ctrl_base_phys = ((u64)*csraddress << 32) | *(csraddress + 1);
-		}
-	}
-
 	return misc_register(&near_mem_map_miscdev);
 }
 module_init(fpga_near_mem_map_init);
@@ -349,9 +319,6 @@ module_init(fpga_near_mem_map_init);
 static void __exit fpga_near_mem_map_exit(void)
 {
 	misc_deregister(&near_mem_map_miscdev);
-
-	if (physaddr_param)
-		iounmap(ha_mem_ctrl_p);
 }
 module_exit(fpga_near_mem_map_exit);
 

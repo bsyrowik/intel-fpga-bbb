@@ -162,15 +162,21 @@ module afu
         .vtp_ports
         );
 
+    // Don't track host channel low-level events
+    host_chan_events_if host_chan_events();
+    host_chan_events_none n(.events(host_chan_events));
+
     // Instantiate the test engine, which will generate requests using
     // virtual addresses.
     host_mem_rdwr_engine_ccip
       #(
-        .ENGINE_NUMBER(0)
+        .ENGINE_NUMBER(0),
+        .ADDRESS_SPACE("VA")
         )
       eng
        (
         .host_mem_if(host_mem_va_if),
+        .host_chan_events_if(host_chan_events),
         .csrs(eng_csr[0])
         );
 

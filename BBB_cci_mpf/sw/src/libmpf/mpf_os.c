@@ -68,6 +68,15 @@
 #define FLAGS_2M (FLAGS_4K | MAP_HUGETLB)
 #define FLAGS_1G (FLAGS_2M | MAP_1G_HUGEPAGE)
 
+static bool is_simulated_fpga;
+
+
+fpga_result mpfOsInit(_mpf_handle_p _mpf_handle)
+{
+    is_simulated_fpga = _mpf_handle->simulated_fpga;
+    return FPGA_OK;
+}
+
 
 void mpfOsMemoryBarrier(void)
 {
@@ -114,9 +123,15 @@ fpga_result mpfOsDestroyMutex(
 {
 #ifndef _WIN32
     pthread_mutex_t* m = (pthread_mutex_t*)mutex;
-    pthread_mutex_destroy(m);
-    free(m);
-    return FPGA_OK;
+    if (pthread_mutex_destroy(m) == 0)
+    {
+        free(m);
+        return FPGA_OK;
+    }
+    else
+    {
+        return FPGA_EXCEPTION;
+    }
 #else
     HANDLE m = (HANDLE)mutex;
     CloseHandle(m);
@@ -242,6 +257,10 @@ fpga_result mpfOsMapMemory(
             // exists, especially for huge pages. Lock the range, forcing pages to
             // be mapped. munmap() still unlocks these pages, so we can just leave
             // them locked. The driver is going to pin them for FPGA access anyway.
+
+            // No need to lock when simulating.
+            if (is_simulated_fpga) break;
+
             int status = mlock(*buffer, size);
             // Success? If no error then leave the buffer locked and return it.
             if (! status) break;
@@ -425,7 +444,7 @@ fpga_result mpfOsGetPageSize(
         {
             // Look for KernelPageSize
             unsigned page_kb;
-            int ret = sscanf(line, "KernelPageSize: %d kB", &page_kb);
+            int ret = sscanf(line, "KernelPageSize: %u kB", &page_kb);
             if (ret == 0)
                 continue;
 
